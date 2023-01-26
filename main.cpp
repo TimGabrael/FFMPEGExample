@@ -63,13 +63,22 @@ int main()
 	Med_GetVideoDimensions(ctx, &w, &h);
 
 	char* imageBuffer = new char[w * h * 4];
+	bool isPaused = true;
 
-	auto start = std::chrono::high_resolution_clock::now();
 	while (!Med_IsFinished(ctx))
 	{
 		auto now = std::chrono::high_resolution_clock::now();
-		float dt = std::chrono::duration<float>(now - start).count();
-		Med_PollVideo(ctx, imageBuffer, dt);
+		if (GetAsyncKeyState(VK_NUMPAD1) & 1)
+		{
+			Med_SetPlaybackTime(ctx, 40.0f);
+		}
+		if (GetAsyncKeyState(VK_SPACE) & 1)
+		{
+			isPaused = !isPaused;
+			Med_SetPlaybackState(ctx, isPaused);
+		}
+
+		Med_PollVideo(ctx, imageBuffer);
 
 		HBITMAP hbmp = CreateBitmap(w, h, 1, 32, imageBuffer);
 		

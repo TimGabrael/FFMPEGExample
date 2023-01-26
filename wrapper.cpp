@@ -11,7 +11,7 @@ extern "C" {
 }
 #include <thread>
 
-#define NUM_VIDEO_FRAME_BUFFERS 20
+#define NUM_VIDEO_FRAME_BUFFERS 16
 #define AUDIO_BUFFER_SIZE 60000
 
 
@@ -57,7 +57,7 @@ static void _Circbuf_Read(CircBuf* buf, void* data, int numRead, int* outRead)
 
 		const int numToRead = numRead > dist ? dist : numRead;
 		if (outRead) *outRead = numToRead;
-
+	
 		int distRead = buf->numElements - (buf->curRead + numToRead);
 		if (distRead < 0)
 		{
@@ -166,7 +166,11 @@ struct MediaContext
 	int64_t audio_write_pts;
 
 	std::thread* thread;
+
+	double start_time;
+
 	bool thread_should_close;
+	bool paused;
 };
 
 static AVPixelFormat correct_for_deprecated_pixel_format(AVPixelFormat pix_fmt) {
@@ -282,6 +286,9 @@ static void _DecodeRoutine(MediaContext* ctx)
 		{
 			_sleep(1);
 		}
+
+
+
 	}
 }
 
@@ -307,7 +314,7 @@ MediaContext* Med_CreateContext(const char* file)
 	int videoStreamIdx = -1;
 	for (int i = 0; i < ctx->fmt_ctx->nb_streams; i++)
 	{
-		AVMediaType type = ctx->fmt_ctx->streams[i]->codec->codec_type;
+		AVMediaType type = ctx->fmt_ctx->streams[i]->codecpar->codec_type;
 		if (type == AVMEDIA_TYPE_AUDIO)
 		{
 			audioStreamIdx = i;
@@ -328,12 +335,12 @@ MediaContext* Med_CreateContext(const char* file)
 	if (videoStreamIdx != -1)
 	{
 		ctx->video_stream = ctx->fmt_ctx->streams[videoStreamIdx];
-		ctx->video_decoder = avcodec_find_decoder(ctx->video_stream->codec->codec_id);
+		ctx->video_decoder = avcodec_find_decoder(ctx->video_stream->codecpar->codec_id);
 	}
 	if (audioStreamIdx != -1)
 	{
 		ctx->audio_stream = ctx->fmt_ctx->streams[audioStreamIdx];
-		ctx->audio_decoder = avcodec_find_decoder(ctx->audio_stream->codec->codec_id);
+		ctx->audio_decoder = avcodec_find_decoder(ctx->audio_stream->codecpar->codec_id);
 	}
 	
 	ctx->frame = av_frame_alloc();
@@ -344,11 +351,12 @@ MediaContext* Med_CreateContext(const char* file)
 			Med_FreeContext(ctx);
 			return nullptr;
 		}
-		_CircBuf_Init(&ctx->video_buf, NUM_VIDEO_FRAME_BUFFERS, ctx->video_stream->codec->width * ctx->video_stream->codec->height * 4);
+		_CircBuf_Init(&ctx->video_buf, NUM_VIDEO_FRAME_BUFFERS, ctx->video_stream->codecpar->width * ctx->video_stream->codecpar->height * 4);
 
-		auto source_pix_fmt = correct_for_deprecated_pixel_format(ctx->video_stream->codec->pix_fmt);
-		ctx->sws_scaler_ctx = sws_getContext(ctx->video_stream->codec->width, ctx->video_stream->codec->height, source_pix_fmt,
-			ctx->video_stream->codec->width, ctx->video_stream->codec->height, AV_PIX_FMT_BGR0,
+		auto source_pix_fmt = correct_for_deprecated_pixel_format((AVPixelFormat)ctx->video_stream->codecpar->format);
+		
+		ctx->sws_scaler_ctx = sws_getContext(ctx->video_stream->codecpar->width, ctx->video_stream->codecpar->height, source_pix_fmt,
+			ctx->video_stream->codecpar->width, ctx->video_stream->codecpar->height, AV_PIX_FMT_BGR0,
 			SWS_BILINEAR, NULL, NULL, NULL);
 		ctx->video_pts_buf = (int64_t*)malloc(sizeof(int64_t) * NUM_VIDEO_FRAME_BUFFERS);
 		if (!ctx->video_pts_buf) {
@@ -365,36 +373,48 @@ MediaContext* Med_CreateContext(const char* file)
 			return nullptr;
 		}
 		
-		int data_size = av_get_bytes_per_sample(ctx->audio_stream->codec->sample_fmt);
+		int data_size = av_get_bytes_per_sample((AVSampleFormat)ctx->audio_stream->codecpar->format);
 		_CircBuf_Init(&ctx->audio_buf, AUDIO_BUFFER_SIZE, data_size);
 	}
 
 	av_init_packet(&ctx->packet);
 
 	
+	auto now = std::chrono::high_resolution_clock::now();
+
+	ctx->start_time = std::chrono::duration<double>(now.time_since_epoch()).count();
+	
 	ctx->thread = new std::thread(_DecodeRoutine, ctx);
+
+
 	return ctx;
 }
 
 
 void Med_PollAudio(MediaContext* ctx, float* buf, int num)
 {
+	if (ctx->paused) return;
 	_Circbuf_Read(&ctx->audio_buf, buf, num, nullptr);
 }
 void Med_GetVideoDimensions(MediaContext* ctx, int* w, int* h)
 {
-	if (w) *w = ctx->video_stream->codec->width;
-	if (h) *h = ctx->video_stream->codec->height;
+	if (w) *w = ctx->video_stream->codecpar->width;
+	if (h) *h = ctx->video_stream->codecpar->height;
 }
-bool Med_PollVideo(MediaContext* ctx, char* buf, float time)
+bool Med_PollVideo(MediaContext* ctx, char* buf)
 {
 	const int sz = _Circbuf_Size(&ctx->video_buf);
-
 	if (sz <= 0) return false;
-	AVRational timebase = ctx->video_stream->codec->pkt_timebase;
-
 	
-	ctx->pts_timer = (int64_t)(time * (timebase.den));
+	const double now = std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+	if (ctx->paused)
+	{
+		ctx->start_time = now - (double)ctx->pts_timer * av_q2d(ctx->video_stream->time_base);
+		return false;
+	}
+	const double time_index = now - ctx->start_time;
+
+	ctx->pts_timer = (int64_t)(time_index / av_q2d(ctx->video_stream->time_base));
 	
 	int reading = -1;
 	for (int i = 0; i < sz; i++)
@@ -420,6 +440,32 @@ bool Med_PollVideo(MediaContext* ctx, char* buf, float time)
 	return false;
 }
 
+void Med_SetPlaybackTime(MediaContext* ctx, float time)
+{
+	auto now = std::chrono::high_resolution_clock::now();
+	ctx->start_time = std::chrono::duration<double>(now.time_since_epoch()).count() - (double)time;
+	
+	if (ctx->video_stream) {
+		const int64_t pt = (int64_t)(time * 1.0 / av_q2d(ctx->video_stream->time_base));
+		const int64_t min_pt = pt - 5000;
+		const int64_t max_pt = pt + 5000;
+		avformat_seek_file(ctx->fmt_ctx, ctx->video_stream->index, min_pt, pt, max_pt, AVSEEK_FORCE);
+	}
+	if (ctx->audio_stream) {
+		const int64_t pt = (int64_t)(time * 1.0 / av_q2d(ctx->audio_stream->time_base));
+		const int64_t min_pt = pt - 5000;
+		const int64_t max_pt = pt + 5000;
+		avformat_seek_file(ctx->fmt_ctx, ctx->audio_stream->index, min_pt, pt, max_pt, AVSEEK_FORCE);
+	}
+	ctx->audio_buf.curRead = ctx->audio_buf.curWrite = 0;
+	ctx->video_buf.curRead = ctx->video_buf.curWrite = 0;
+	
+}
+void Med_SetPlaybackState(MediaContext* ctx, bool paused)
+{
+	ctx->paused = paused;
+}
+
 bool Med_IsFinished(MediaContext* ctx)
 {
 	if (ctx->thread_should_close)
@@ -441,7 +487,7 @@ void Med_FreeContext(struct MediaContext* ctx)
 		ctx->thread_should_close = false;
 	}
 
-	if (ctx->fmt_ctx) { avformat_free_context(ctx->fmt_ctx); ctx->fmt_ctx = nullptr; }
+	if (ctx->fmt_ctx) { avformat_close_input(&ctx->fmt_ctx); ctx->fmt_ctx = nullptr; }
 	ctx->video_stream = nullptr;
 	ctx->video_decoder = nullptr;
 	ctx->audio_stream = nullptr;
